@@ -1,0 +1,679 @@
+---
+title: "Final Project"
+author: "kimchi-stew"
+date: "May 4th, 2018"
+output: github_document
+---
+###Set up
+
+```{r setup, include = FALSE}
+# set the echo option to FALSE to see how the document looks with the code suppressed
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+### Load Packages & Data
+
+```{r load-packages-data, message=FALSE}
+library(stringr)
+library(stringi)
+library(tidyverse)
+library(broom)
+library(splitstackshape)
+library(rpart)
+library(rpart.plot)
+library(RColorBrewer)
+library(rlist)
+library(randomForest)
+library(miscTools)
+library(ggplot2)
+library(ggmap)
+library(maps)
+library(mapdata)
+library(gridExtra)
+
+set.seed(415)
+# run load-data.R first
+food <- read_csv("data/food.csv")
+food_attr <- read_csv("data/food-attributes.csv") 
+food_hours <- read_csv("data/food-hours.csv")
+
+food_attr <- food_attr %>% 
+  select(-starts_with("DietaryRestrictions"))
+
+food_attr_col <- colnames(food_attr) %>% 
+  as.data.frame() %>%
+  mutate(cols = str_replace(., "-", "_")) %>% 
+  select(-.) %>% 
+  pull()
+
+colnames(food_attr) <- food_attr_col
+
+```
+
+### Introduction
+
+For our final project, we worked with a Yelp dataset. Yelp is a web and mobile platform that publishes crowd-sourced reviews about local businesses, as well as online reservation service through Yelp reservations. The data we used was released by the Yelp Dataset Challenge to encourage students to conduct research and analysis. The scope of the dataset is extremely wide including business information, reviews and user data. Even the business subset contains information about 174,000 businesses and over 1.2 million business attributes, such as workday hours, parking, and ambience. Given this huge dataset, we decided to narrow down our interests and perform analysis specifically on the restaurant data. We were interested in exploring what attribute contribute to high restaurant star ratings on Yelp.  Eventually, we wanted to construct a regression model that predicts the star ratings of restaurants based on their attributes.
+ 
+We started by converting dataset from JSON form to CSV files. The R package jsonlite was used to stream in the json file and flatten it. The conversion happened in the load-data R script, in which we also cleaned up the data using functions from the stringr package. In addition, the data was split into multiple, csv subsets that can later be joined by the common variable, business_id. 
+1)    Food.csv (general business information): 69070 observations and 13 variables, including name, city, state, longitude, latitude, categories, etc.
+2)    Food_attributes.csv (business attributes information): 69070 observations and 66 variables, including GoodForKids, RestaurantsAttire, WiFi, etc.
+3)    Food_hours.csv (business hour information): 69070 observations and 8 variables, including hours.Monday, hours.Tuesday, etc.
+
+Before building our linear model, we created rudimentary visualizations to get a sense of the overall trend of the data. 
+
+```{r initial_visualizations}
+
+food_stars <- food %>%
+  count(stars) %>% 
+  arrange(desc(stars)) 
+
+ggplot(data = food_stars,aes(x = stars,y= n)) +
+  geom_bar(stat = "identity",fill = "steelblue")+
+  labs(title = "Count of of star ratings",y = "count")+
+  geom_text(aes(label = n),position = "stack",vjust = 0) +
+  scale_x_continuous(breaks = c(1,1.5,2,2.5,3,3.5,4,4.5,5))
+
+food %>%
+  summarise(mean = mean(stars),median = median(stars))
+
+```
+
+The first bar graph showed the counts of each star rating categories. It’s important to note that star ratings on Yelp are not continuous, but discrete, and the ratings change by increments of 0.5. Therefore, we could not approximate the ratings with a normal distribution. However, we did know from summary statistics that both mean and median star ratings are approximately 3.5. Additionally, we should consider the possible anchoring effect that one review could have on another. Reviews are not random like throwing dice and adding up the sum. Both the nature of review ratings and the discrete system implemented by Yelp should be considered when evaluating the validity and predictability of our multiple regression linear model. 
+
+We also did a simple map to visualize the locations of the restaurants. This is because the Yelp website specified that there are 11 metropolitan areas within this dataset but we were seeing many more cities than 11. Therefore we just wanted to create a visualization to see all restaurant locations. 
+
+```{r map}
+usa <- map_data("usa")
+world_map <- map_data("world")
+p <- ggplot() + coord_fixed() +
+  xlab("") + ylab("")
+
+#Add map to base plot
+base_world_messy <- p + geom_polygon(data=world_map, aes(x=long, y=lat, group=group), 
+                               colour="black", fill="black")
+cleanup <- 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = 'white', colour = 'white'), 
+        axis.line = element_line(colour = "white"), legend.position="none",
+        axis.ticks=element_blank(), axis.text.x=element_blank(),
+        axis.text.y=element_blank())
+
+base_world <- base_world_messy + cleanup
+
+food %>% 
+  filter(longitude > 100)
+
+food %>% 
+  filter(longitude < -130) 
+
+food <- food %>% 
+  filter(longitude < 100 & longitude >-130) 
+  #%>% 
+  #filter(business_id != "vBxK_MAGuy8eWL_CCfUCUQ") %>% 
+  #filter(latitude > -20 | latitude < -45)
+
+map_data <- 
+  base_world +
+  geom_point(data=food, 
+             aes(x=longitude, y=latitude), colour="red", 
+             fill="Pink",pch=21, size=5, alpha=I(0.5))
+map_data
+
+
+```
+
+The map graph showed that there are indeed many more cities included in the dataset but the majority of cities are in North American and Europe. 
+
+### Methods
+
+To make our analysis more efficient we had cut down and reformat our code. The issues we had to solve for were the following: aggregate related columns by some protocol and find the subset of columns that maximize non-null rows and number of attributes. 
+
+```{r recode_variables, message=FALSE, warning=FALSE}
+
+### this block counts up non-null values 
+
+# create new var to represent if at least one of the subvalues is true
+food_attr_temp <- food_attr %>% 
+  select(-business_id) %>% 
+  mutate(BusinessParking =  BusinessParking.garage	  == TRUE	|	 	
+                            BusinessParking.street    == TRUE |				
+                            BusinessParking.validated	== TRUE	|	 
+                            BusinessParking.lot       == TRUE |	
+                            BusinessParking.valet     == TRUE,
+         Music =  Music.dj                == TRUE |				
+                  Music.background_music	== TRUE |			
+                  Music.no_music		      == TRUE |		
+                  Music.karaoke	          == TRUE |			
+                  Music.live              == TRUE | 
+                  Music.video             == TRUE |			
+                  Music.jukebox	          == TRUE ,	
+         Ambience = Ambience.romantic	== TRUE |			
+                    Ambience.intimate	== TRUE |			
+                    Ambience.classy		== TRUE |		
+                    Ambience.hipster	== TRUE |			
+                    Ambience.divey		== TRUE |		
+                    Ambience.touristy	== TRUE |			
+                    Ambience.trendy		== TRUE |		
+                    Ambience.upscale  == TRUE |
+                    Ambience.casual		== TRUE,	
+         BestNights = BestNights.monday	  	== TRUE |	
+                      BestNights.tuesday		== TRUE |			
+                      BestNights.friday			== TRUE |		
+                      BestNights.wednesday	== TRUE |				
+                      BestNights.thursday		== TRUE |			
+                      BestNights.sunday			== TRUE |		
+                      BestNights.saturday		== TRUE,	
+         GoodForMeal =  GoodForMeal.dessert   == TRUE |		
+                        GoodForMeal.latenight	== TRUE |
+                        GoodForMeal.lunch		  == TRUE |			
+                        GoodForMeal.dinner		== TRUE |			
+                        GoodForMeal.breakfast	== TRUE |		
+                        GoodForMeal.brunch		== TRUE)	
+
+# recode null and non null with 0/1
+food_attr_temp[is.na(food_attr_temp)] <- 0
+food_attr_temp[food_attr_temp != 0] <- 1
+
+# sum up to get non null values
+food_attr_counts <- food_attr_temp %>% 
+  summarise_all(funs(sum(. == 1))) %>% 
+  gather(attribute, total, 1:ncol(.)) %>% 
+  arrange(desc(total))
+
+# for categories broken into multiple columns, get frequency of occurences
+level_props <- data.frame(attribute = colnames(food_attr)) %>% 
+  filter(str_detect(attribute, "\\.")) %>% 
+  inner_join(food_attr_counts, by = "attribute") %>% 
+  mutate(attribute_parent = str_remove(attribute, "\\..+"),
+         attribute = str_remove(attribute, ".+\\.")) %>%
+  rename(subtotal = total) %>% 
+  inner_join(food_attr_counts, by = c("attribute_parent" = "attribute")) %>% 
+  mutate(prop = subtotal / total) %>% 
+  mutate(subtotal = case_when(attribute == "hipster" ~ as.double(858),
+                              attribute != "hipster" ~ as.double(subtotal))) %>% 
+  arrange(attribute_parent, desc(prop)) 
+
+# manually break tie
+level_props[4,2] <- 858
+level_props[4,5] <- 0.03737
+
+```
+
+```{r count_columns_to_find_variables_for_analysis, warning=FALSE}
+
+### this code block merges the multi column attribues into single columns
+### and if there are multiple values follows a protocol (min, max, or prob) 
+### to determine which value should represent the row
+### e.g. the merged BestNights column might have `wednesday,friday,sunday`,
+### and if `wednesday` appears least in the dataset, the min protocol 
+### would reduce this to `wednesday`
+
+
+# this function changes the formatting of the multicolumn attributes 
+# true values take on the name of the column, false values are periods
+convert_dot <- function(col_name) {
+  col_name_short <- str_remove(col_name, ".+\\.")
+  index <- grep(col_name, colnames(food_attr))
+  col <- food_attr[index]
+  col[col == TRUE] <- paste0(col_name_short, ",")
+  col[col == FALSE] <- "."
+  return(col)
+}
+
+# get the names of the multi-column attributes
+lst <- food_attr %>% 
+  select(contains(".")) %>% 
+  colnames() 
+
+food_attr_convert <- purrr::map(lst, convert_dot) %>% 
+  as.data.frame()
+
+# aggregate the columnn by pasting together the variable values;
+# since true values are the name of the column, this column tells us the names
+# of the sub attributes that are true... formatting at the end
+food_attr_convert <- food_attr_convert %>% 
+  mutate(aggBusinessParking =  paste0(BusinessParking.garage,	 	
+                                      BusinessParking.street,			
+                                      BusinessParking.validated,	 
+                                      BusinessParking.lot,
+                                      BusinessParking.valet, sep=""),
+         aggMusic = paste0(Music.dj,				
+                           Music.background_music,		
+                           Music.no_music,
+                           Music.karaoke	,
+                           Music.live,
+                           Music.video,			
+                           Music.jukebox, sep=""),
+         aggAmbience = paste0(Ambience.romantic,
+                              Ambience.intimate,		
+                              Ambience.classy	,	
+                              Ambience.hipster,		
+                              Ambience.divey	,	
+                              Ambience.touristy,		
+                              Ambience.trendy	,	
+                              Ambience.upscale,
+                              Ambience.casual, sep=""),
+         aggBestNights = paste0(BestNights.monday	 ,	
+                                BestNights.tuesday		,	
+                                BestNights.friday			,
+                                BestNights.wednesday	,		
+                                BestNights.thursday		,	
+                                BestNights.sunday			,
+                                BestNights.saturday, sep=""),
+         aggGoodForMeal = paste0(GoodForMeal.dessert,		
+                                 GoodForMeal.latenight,
+                                 GoodForMeal.lunch		  ,	
+                                 GoodForMeal.dinner		,	
+                                 GoodForMeal.breakfast	,
+                                 GoodForMeal.brunch, sep="")) %>% 
+  select(-contains(".")) %>% 
+  mutate_all(funs(str_replace_all(.,",+", ","))) %>% 
+  mutate_all(funs(str_replace_all(., "[NA]+", "NA"))) %>% 
+  mutate_all(funs(str_remove_all(., "\\.NA|NA\\."))) %>% 
+  mutate_all(funs(str_replace_all(., "^\\.+$", "None"))) %>% 
+  mutate_all(funs(str_remove_all(., "\\.+"))) %>% 
+  mutate_all(funs(str_remove(.,"^,"))) %>% 
+  mutate_all(funs(str_remove(.,",$")))
+
+# turn "NA" into NA
+food_attr_convert[food_attr_convert == "NA"] <- NA
+
+### PROBLEM: too many collisions between variables - need to reduce to one value; don't want to eliminate too much information
+### SOLUTION1: choose in order of frequency, low to high
+### IMPLEMENTATION: iterate through, call function: if (numberofcommas + 1) > 1: split into vector, for each element in vector
+### PROBLEM: if all slightly equal numbers but still collisions, some vals might not get seen
+
+# min protocol: picks the least frequent value
+pick_index_min <- function(freq_vect) {
+  return(grep(min(freq_vect), freq_vect))
+}
+
+# max protocol: picks the most frequent value
+pick_index_max <- function(freq_vect) {
+  return(grep(max(freq_vect), freq_vect))
+}
+
+# prob protocol: picks the value probabilistically according to frequency so that
+# same combinations of values aren't always the same
+pick_index_prob <- function(freq_vect) {
+  ord_vect <- sort(freq_vect)
+  total <- reduce(freq_vect, sum)
+  ord_vect_prob <- sapply(ord_vect, function(x) x/total)
+  rev_vect_prob <- sort(ord_vect_prob, decreasing = TRUE)
+  for (i in 2:length(rev_vect_prob)){
+    rev_vect_prob[[i]] <- rev_vect_prob[[i]] + rev_vect_prob[[i-1]]
+  }
+  rand <- runif(1)
+  ind <- which(sapply(rev_vect_prob, function (x) x > rand))[[1]]
+  return(grep(ord_vect[[ind]],freq_vect))
+}
+
+# this function reduces a row of multiple values to a single value
+# according to some protocol, in this case min
+my_reduce <- function(col) {
+
+  for (i in 1:length(col)) {
+    val_list <- col[[i]]
+    if (is.na(val_list) | val_list == "None" | !str_detect(val_list, ",")) {
+      col[[i]] <- val_list
+    } else {
+      vals <- unlist(str_split(val_list, ","))
+      freq_vect <- c()
+      for (val in vals) {
+        freq <- level_props %>%
+          filter(attribute == val) %>%
+          select(subtotal) %>%
+          pull()
+        freq_vect <- c(freq_vect, freq)
+      }
+      index <- pick_index_min(freq_vect)
+      col[[i]] <- vals[index]
+    }
+  }
+  return(col)
+}
+
+# apply the function
+food_attr_reduce <- food_attr_convert %>% 
+  mutate_all(funs(my_reduce))
+
+```
+
+For the first problem, there were 6 columns that were initially broken up across around 30 columns. For example, the column GoodForMeal was initially split up as a column for every meal encoded as true or false, since a restaurant could be good for multiple meals. We needed to aggregate these values into a single column, but we had to figure out how to handle collisions when two or more columns were true. We created a function to reduce these aggregated columns, replacing their list of values with the value that occurs most in the dataset. 
+
+```{r prep-data-set, warning = FALSE}
+
+convert <- function(col_name, tbl) {
+  index <- grep(col_name, colnames(tbl))
+  col <- tbl[index]
+  col[!is.na(col)] <- paste0(col_name, ",")
+  col[is.na(col)] <- ""
+  return(col)
+}
+
+column_list <- food_attr_temp %>% 
+  select(1:65) %>% 
+  select(-contains(".")) %>% 
+  summarise_all(funs(sum(. == 1))) %>% 
+  gather(attribute, total, 1:ncol(.)) %>% 
+  arrange(desc(total)) %>% 
+  filter(total > 10000) %>% 
+  pull(attribute)
+
+test_df <- food_attr[c(column_list)] %>% 
+  cbind(food_attr_reduce)
+
+test_columns <- purrr::map(colnames(test_df), function(x) convert(x,food_attr)) %>% 
+  as.data.frame() %>% 
+  unite(attr,sep = "", remove = TRUE) %>% 
+  count(attr) %>% 
+  mutate(num_attr = str_count(attr, ","),
+          opt_score = num_attr*n) %>% 
+  filter(opt_score > 0) %>% 
+  arrange(desc(num_attr * n)) %>% 
+  pull(attr) %>% 
+  sapply(function(x) unlist(strsplit(x, split=",")))
+```
+
+```{r find-optimal-column, warning=FALSE}
+cols_eval <- function(col_names, tbl) {
+  food_attr_local <- tbl[col_names]
+  output <- food_attr_local %>% 
+    drop_na() %>% 
+    summarise(n = nrow(.),
+              attr = paste0(col_names, collapse = ",")) %>% 
+    mutate(num_attr = length(col_names),
+           opt_score = n*num_attr)
+  
+  return(output)
+}
+
+powerset <- function(vect) {
+  total <- character()
+  range <- c(((6 * length(vect)) %/% 10):length(vect))
+  print(range)
+  for (m in range) {
+    x <- combn(vect, m, simplify = FALSE)
+    total <- append(total,x)
+  }
+  return(total)
+}
+
+find_best_cols <- function(tbl) {
+  #pwrset <- powerset(colnames(tbl))
+  result <- map_df(test_columns, function(x) cols_eval(x,tbl)) %>%               
+    arrange(desc(opt_score)) %>% 
+    select(attr, opt_score, n, num_attr)
+  return(result)
+}
+
+all_cols <- find_best_cols(test_df[1:22])
+all_cols %>%
+  ggplot(aes(x = num_attr, y = n, z = opt_score, color = (n*num_attr))) +
+  geom_point(size = 4, alpha = 1) +
+  stat_function(fun = function(x) 412555/(.5*x), color = "red") +
+  stat_function(fun = function(x) 412555/x, color = "red") +
+  stat_function(fun = function(x) 412555/(2*x), color = "red") +
+  stat_function(fun = function(x) 412555/(4*x), color = "red") +
+  stat_function(fun = function(x) 412555/(8*x), color = "red") +
+  scale_color_distiller(palette = "Blues", direction = 1) +
+  theme_minimal() +
+  ylim(0,75000) +
+  labs(color = "Optimization Function", y = "Number of Rows", x = "Number of Attributes", title = "Finding best combination of columns", subtitle = "Optimizing for number of rows and number of attributes")
+
+(candidate_columns <- all_cols %>%
+  top_n(3, opt_score) %>%
+  pull(attr))
+
+```
+
+Now that we handled that, we had to find the subset of columns that would maximize the amount of data that we would have. This means maximizing rows times columns. We created a function that calculates the amount of data in the subset of some combination of tables. To find the optimal combination, we would have to try every possible combination of columns, which is equivalent to the powerset of the columns. And since we were working with 22 columns. This would be 2^22. So we clearly couldn’t do that. To get around this we first looked at the possible combinations of columns that actually existed in the dataset. This cut down our search space from 2^22 to around 5000. A significant improvement. From there we calculated the subset of the dataset that would maximize our data.
+
+```{r final-dataset}
+
+# use the significant columns found to trim down dataset
+# this puts together the significant columns we found with our new merged columns, drop NA's
+food_attr_mod_2 <- food_attr %>% 
+  cbind(food_attr_reduce) %>% 
+  select(business_id, BusinessAcceptsCreditCards,RestaurantsPriceRange2,GoodForKids,BikeParking,Alcohol,HasTV,NoiseLevel,RestaurantsAttire,RestaurantsGoodForGroups,Caters,WiFi,RestaurantsReservations,RestaurantsTakeOut, aggBusinessParking, aggAmbience, aggGoodForMeal) %>% 
+  drop_na()
+
+food_tall <- food %>% 
+  cSplit("categories", direction = "tall", sep = ",") 
+
+category_counts <- food_tall %>% 
+  count(categories) %>% 
+  arrange(desc(n))
+
+# this function reduces a row of multiple values to a single value
+# according to some protocol, in this case max
+my_reduce_2 <- function(col) {
+
+  for (i in 1:length(col)) {
+    val_list <- col[[i]]
+    if (is.na(val_list) | val_list == "None" | !str_detect(val_list, ",")) {
+      col[[i]] <- val_list
+    } else {
+      vals <- unlist(str_split(val_list, ","))
+      freq_vect <- c()
+      for (val in vals) {
+        freq <- category_counts %>%
+          filter(categories == val) %>%
+          select(n) %>%
+          pull()
+        freq_vect <- c(freq_vect, freq)
+      }
+      index <- pick_index_max(freq_vect)
+      col[[i]] <- vals[index]
+    }
+  }
+  return(col)
+}
+
+# reduce the categories variable
+food$categories <- my_reduce_2(food$categories)
+
+# pull the top 50 categories
+large_categories_list <- food %>% 
+  count(categories) %>% 
+  arrange(desc(n)) %>% 
+  head(50) %>% 
+  pull(categories)
+
+# filter by the top 50 categories
+food_reduce <- food %>% 
+  filter(categories %in% large_categories_list)
+
+# merge the business info dataset with the business attributes 
+food_reduce <- food_reduce %>% 
+  inner_join(food_attr_mod_2, by = "business_id")
+
+# turn character columns into factors
+cols = c("Alcohol", "NoiseLevel", "RestaurantsAttire", "WiFi", "aggBusinessParking", "aggAmbience", "aggGoodForMeal", "categories")
+food_reduce[cols] <- lapply(food_reduce[cols], factor)
+
+# create training set
+train_full <- food_reduce %>% 
+  head(9*nrow(food_reduce)/10)
+
+# create test set
+test_full <- food_reduce %>% 
+  tail(1*nrow(food_reduce)/10)
+
+```
+
+With this full dataset, we performed a linear regression using the following characteristics to predict star score: food within price range of 11-30(dollars), good for kids, acceptance of credit cards, bike parking, alcohol sold, TV present, noise level, dress code, fit for groups, catering ability, WiFi present, accepts reservations, takeout offered, parking available, ambience, and best mealtime. 
+
+```{r linear-regression}
+#run linear analysis 
+lm_food <- lm(stars ~ RestaurantsPriceRange2 + categories + BusinessAcceptsCreditCards + Alcohol +  HasTV + NoiseLevel +  RestaurantsGoodForGroups + Caters + WiFi + aggBusinessParking + aggAmbience + aggGoodForMeal + review_count + BikeParking + GoodForKids + RestaurantsReservations + RestaurantsTakeOut + RestaurantsAttire + RestaurantsGoodForGroups,data = food_reduce)
+
+summary(lm_food)$r.squared
+
+lm_food
+```
+
+This linear model suggests that in an alternate reality, if a restaurant demonstrated none of the above characteristics, the star rating would be 3.86. For each attribute a restaurant has, its rating increases or decreases according to each attribute’s coefficient multiplied by the value assigned to the attribute. The adjusted R-squared value for this linear model is 0.233, meaning that this model accounts for approximately 23.3% of the variability in the stars values. This low score indicates that the linear regression model insufficiently describes the data and has low predictive power.  
+
+```{r rpart-regression-tree}
+fit <- rpart(stars ~ categories+BusinessAcceptsCreditCards+RestaurantsPriceRange2+GoodForKids+BikeParking+Alcohol+HasTV+NoiseLevel+RestaurantsAttire+RestaurantsGoodForGroups+Caters+WiFi+RestaurantsReservations+RestaurantsTakeOut+aggBusinessParking+aggAmbience+aggGoodForMeal, method = "anova", data = food_reduce)
+
+par(mfrow=c(1,2)) # two plots on one page 
+rsq.rpart(fit) # visualize cross-validation results  
+
+prune(fit, cp = 0.02)
+
+plot(fit, uniform=TRUE, 
+  	main="Regression Tree for Mileage ")
+text(fit, use.n=TRUE, all=TRUE)
+
+```
+
+Since the R-squared value we got from the multiple linear regression model was quite low, we wanted to explore results from other potential regression methods. Our next attempt was to build a regression decision tree using the rpart package. The decision tree algorithm is better at capturing non-linearity in the data by dividing space into smaller sub-spaces. In the following code chunk, we grew the tree using the same variables as we had in the multiple linear regression model. The resulting R-squared of the model was 0.14736, meaning that approximately 14.7% of the variability in the star ratings was accounted for by the model. 
+  
+Next, we plotted two graph p1 and p2. P1 showed the predicted stars vs. acutal stars and we colored that data point by restaurant categories. P2 demonstrated the residuals vs. predicted stars. The center of the residual plot is approximately in the middle with data points radiating in a circular shape. 
+
+```{r predicted_residual}
+predicted_stars <- fitted(lm_food)
+stars_original <- food_reduce$stars
+
+p1 <-ggplot(lm_food,mapping =aes(stars_original,.fitted, color = factor(categories))) +
+  geom_jitter(alpha = 0.5, width = 0.5, height = 0.5 )+
+  labs(x = "Actual stars", y = "Predicted Stars",title = "Predicted vs Actual Stars") +
+  theme_minimal() +
+  theme(legend.position="none",plot.title = element_text(hjust = 0.5))
+p1
+
+residual <- resid(lm_food)
+residual_jitter = jitter(residual,amount = .01)
+p2 <- ggplot(lm_food,mapping = aes(.fitted,residual_jitter, color = factor(categories))) +
+  geom_jitter(alpha = 0.5, width = 0.5, height = 0.5 )+
+  labs(x = "Predicted stars", y = "Residuals",title = "Residual Plot of Stars")+
+  theme_minimal() +
+  theme(legend.position="none",plot.title = element_text(hjust = 0.5))+
+  geom_hline(yintercept=0, linetype="dashed", color = "red")
+p2
+```
+
+
+```{r random_forest}
+
+# run random forest
+fit_full <- randomForest(stars ~  RestaurantsPriceRange2 + categories + BusinessAcceptsCreditCards + Alcohol +  HasTV + NoiseLevel +  RestaurantsGoodForGroups + Caters + WiFi + aggBusinessParking + aggAmbience + aggGoodForMeal + review_count + BikeParking + GoodForKids + RestaurantsReservations + RestaurantsTakeOut + RestaurantsAttire + RestaurantsGoodForGroups, 
+                    data=train_full, 
+                    importance=TRUE,  
+                    ntree=50)
+
+# inspect which elements are important
+varImpPlot(fit_full)
+
+# get r^2
+(r2 <- rSquared(test_full$stars, test_full$stars - predict(fit_full, test_full)))
+
+# plot learning curve
+plot(fit_full)
+
+# get info on model
+fit_full
+
+# predict values on test set
+predict_tbl <- predict(fit_full, test_full) %>% 
+  as.data.frame()
+
+# modify predict_tbl
+colnames(predict_tbl) <- c("predicted_score")
+for (i in 1:nrow(predict_tbl)){
+  predict_tbl[i,"index"] <-  i 
+}
+
+# find rows with highest predicted stars in test set
+predict_tbl %>% 
+  top_n(1, predicted_score) %>% 
+  pull() %>% 
+  test_full[.,] %>% 
+  select(-business_id, -address, -postal_code, -latitude, -longitude, -is_open) %>% 
+  head(10)
+
+```
+
+Next, we constructed a random forest. The random forest algorithm is an ensemble learning method that can be used for classification, regression and other tasks. By training a multitude of decision trees, random forest is optimized to have better predicted power. It discovers more complex dependencies at the cost of more time needed to fit a model. Compared to linear regression, random forest outperforms when there are nonlinear dependencies. The resulting R-squared of the model was 0.277, meaning that approximately 27.7% of the variability in the star ratings was accounted for by the model. In addition we got RMSE of 0.333, giving a standard deviation of 0.57. From this we can construct a 95% confidence interval around our predictions. We are 95% confident that the actual star rating will be between ±1.14 stars of the predicted value.
+
+```{r random_forest_func, message=FALSE, warning=FALSE}
+
+# this function performs the above analysis for any subset of the dataset
+random_forest <- function(x){
+  food_reduce <- food_reduce %>% 
+    filter(categories == x)
+
+  cols = c("Alcohol", "NoiseLevel", "RestaurantsAttire", "WiFi", "aggBusinessParking", "aggAmbience", "aggGoodForMeal", "categories")
+  food_reduce[cols] <- lapply(food_reduce[cols], factor)
+  
+  train_full <- food_reduce %>% 
+    head(9*nrow(food_reduce)/10)
+  
+  test_full <- food_reduce %>% 
+    tail(1*nrow(food_reduce)/10)
+  
+  fit_full <- randomForest(stars ~  RestaurantsPriceRange2 + categories + BusinessAcceptsCreditCards + Alcohol +  HasTV + NoiseLevel +  RestaurantsGoodForGroups + Caters + WiFi + aggBusinessParking + aggAmbience + aggGoodForMeal + review_count + BikeParking + GoodForKids + RestaurantsReservations + RestaurantsTakeOut + RestaurantsAttire + RestaurantsGoodForGroups , 
+                      data=train_full, 
+                      importance=TRUE,  
+                      ntree=200)
+  
+  r2 <- round(rSquared(test_full$stars, test_full$stars - predict(fit_full, test_full)),3) %>% 
+    as.data.frame()
+  
+  colnames(r2) <- "r.squared" 
+    
+  predict_tbl <- predict(fit_full, test_full) %>% 
+  data.frame()
+
+  colnames(predict_tbl) <- c("predicted_score")
+  for (i in 1:nrow(predict_tbl)){
+    predict_tbl[i,"index"] <-  i 
+  }
+
+  # find rows with highest predicted stars in test set
+  predict_tbl <- predict_tbl %>% 
+    top_n(3, predicted_score) 
+  
+  output <- predict_tbl %>% 
+    pull(index) %>% 
+    test_full[.,] %>% 
+    select(-business_id, -address, -postal_code, -latitude, -longitude, -is_open) 
+
+  # plot(fit_full, main = x)
+  
+  return(cbind(predict_tbl[1], r2, output))
+  #return(as.data.frame(r2))
+
+}
+
+#Apply the function random forest to each element of the vector large_categories_list
+categories_rows <-large_categories_list[1:20]
+
+r_squared <- purrr::map(categories_rows,random_forest)
+
+
+r_categories <-cbind(r_squared,categories_rows)
+r_categories_dt <- as.data.frame(r_categories, stringsAsFactors = FALSE)
+
+best_row <- purrr::map_df(categories_rows,random_forest)
+best_row %>% 
+  arrange(desc(r.squared), desc(predicted_score)) %>% 
+  select(categories, everything()) %>% 
+  head(10)
+
+```
+
+Finally, we used this random forest analysis to look at subsets of our dataset. We looked at the most frequent categories and then one by one filtered the dataset by one of them. We did a random forest analysis for each one, getting R-squared values as well as the top row in that dataset with the highest predicted star rating. Interestingly, fast_food was the category whose star values were best predicted by the data — it had an R-squared value of 38%!
+
+### Discussion and Conclusions
+
+
+Of the three analytical methods we used, the random forest algorithm best predicted the star rating of a restaurant. The algorithm accounted for 27.7% of the variance in the star data, a greater percentage than either the linear regression model (23.3%) or the decision tree algorithm (14.7%). This hierarchy in results isn’t unusual, as the random forest algorithm is a machine learning algorithm that trains a multitude of decision trees, rather than just one, to optimize fit to a dataset. The failure of the individual decision tree is likely because of the 19 variables inputted into the simple decision tree, only four were used to predict star rating, leading to possible underspecification. Lastly, the low R-squared value for linear regression model implies that this model poorly predicts star rating, and possibly that the data is non-linear. If the data is truly non-linear, the results for the random forest and decision tree algorithms would be similarly affected. In conclusion, of the three methods we used, the random forest algorithm was most accurate in predicting star rating. At first, we believed that our low R-squared value for the linear regression model was because our data was non-linear. However, both the random forest and decision tree algorithms are further optimized for non-linear data, and they also returned low R-squared values. This ultimately suggests that our research question can't be answered with this dataset, and that in future project explorations, we should investigate different kinds of questions.  
+ 
+The primary difficulty we encountered in this project was preparing our rough data into a dataset we could use for analysis. For several variables, such as BusinessParking and GoodForMeal, the data was not aggregated, so we recoded the variables so that they presented information in levels, rather than multiple variable columns. Another challenge was determining which variables were most relevant to our analysis. Our process involved trying many different combinations of columns and then checking how many observations with those variables had no null values. We optimized for both the maximum number of columns as well as for non-null values. Ultimately, we determined that the aforementioned set of variables produced the largest number of observations with non-null values.
+ 
+The principal failure of our project is that our analysis cannot address the intangible, qualitative aspects of what leads to a restaurant earning more stars on Yelp. Star ratings are not completely random. There are many factors that can affect how a user decides on a particular restaurant rating. For example, personal taste is a huge factor in an individual’s decision-making process, and because taste varies significantly across individuals, there is no standardized way measure it. Factors such as distance to a restaurant or neighborhood can greatly influence individual choice. Depending on the location, an individual’s ability to even reach certain restaurant locations varies. Restaurant rating on Yelp is based on the feedback of its users, thus restaurants can fall victim to the anchoring effect. Previous positive reviews or a high star rating influence the subsequent reviews and ratings by other users of the same restaurant. Consequently, we cannot say with confidence that any star rating is an objective measure of a restaurant’s quality. Furthermore, Yelp requires users to rank restaurants in 0.5 increments and similarly rounds the mean star rating to the nearest 0.5 value. Because the predicted results are calculated in a continuous fashion, they will always be off from the actual, possible star values. Considering both the limitations of human ratings and Yelp’s use of a discrete rating system, the research question we have asked for this dataset might not receive the best predicted value. 
+
+There are several aspects that we can do differently to improve the results of our data analysis. As we have discussed earlier, the random forest algorithm produces a better R-squared value as it works better for non-linear dependencies. Therefore, we can transform our data and fit a logarithmic or exponential regression model to evaluate whether they produce more promising results. Additionally, we did not utilize all relevant variables given in the dataset. For example, we can better characterize restaurant by putting them into clusters by location and perform regression models based on the different clusters. We can also expand on our research question. Instead of just predicting star ratings based on attributes, we can take a step further to provide restaurants suggestions on how they can improve their star ratings knowing their current attributes. This will be a more useful application of such data analysis. 
